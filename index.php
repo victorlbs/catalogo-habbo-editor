@@ -29,6 +29,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_action'])) {
             $stmt->execute([$_POST['caption'], $caption_save, $_POST['parent_id'], $_POST['icon_image'], $_POST['page_layout'], $_POST['order_num'], $_POST['page_headline'], $_POST['page_text1'], $_POST['page_text2'], $_POST['page_text_details'], $_POST['page_id']]);
             echo json_encode(['success' => true]);
         }
+        elseif ($_POST['ajax_action'] === 'reorder_pages') {
+            if (isset($_POST['page_ids']) && is_array($_POST['page_ids'])) {
+                $stmt = $pdo->prepare("UPDATE catalog_pages SET order_num=? WHERE id=?");
+                foreach ($_POST['page_ids'] as $index => $id) {
+                    $stmt->execute([$index + 1, $id]);
+                }
+            }
+            echo json_encode(['success' => true]);
+        }
+        elseif ($_POST['ajax_action'] === 'rename_page') {
+            $stmt = $pdo->prepare("UPDATE catalog_pages SET caption=?, caption_save=? WHERE id=?");
+            $caption_save = strtolower(str_replace(' ', '_', $_POST['caption']));
+            $stmt->execute([$_POST['caption'], $caption_save, $_POST['page_id']]);
+            echo json_encode(['success' => true, 'new_caption' => htmlspecialchars($_POST['caption'])]);
+        }
     } catch (Exception $e) {
         echo json_encode(['success' => false, 'error' => $e->getMessage()]);
     }
@@ -74,17 +89,56 @@ foreach ($allPages as $p) {
 $activeTabId = isset($_GET['tab']) ? $_GET['tab'] : (count($topTabs) > 0 ? $topTabs[0]['id'] : -1);
 $activePageId = isset($_GET['page']) ? (int)$_GET['page'] : -1;
 
-function drawSidebarMenu($parentId, $subPages, $activeTabId, $activePageId, $level = 0) {
+$activePath = [];
+$curr = $activePageId;
+while ($curr != -1 && $curr != 0) {
+    $activePath[] = $curr;
+    $parent = -1;
+    foreach ($allPages as $p) {
+        if ($p['id'] == $curr) {
+            $parent = $p['parent_id'];
+            break;
+        }
+    }
+    if ($parent == -1 || in_array($parent, $activePath)) break;
+    $curr = $parent;
+}
+
+function drawSidebarMenu($parentId, $subPages, $activeTabId, $activePageId, $activePath, $level = 0) {
     if (!isset($subPages[$parentId])) return;
+    
+    echo "<div class='sortable-level'>"; 
     foreach ($subPages[$parentId] as $sp) {
         $isActive = ($activePageId == $sp['id']);
+        $hasChildren = isset($subPages[$sp['id']]);
+        $isOpen = in_array($sp['id'], $activePath); 
         $padding = 10 + ($level * 15);
-        echo "<a href='?tab={$activeTabId}&page={$sp['id']}' class='" . ($isActive ? 'active' : '') . "' style='padding-left: {$padding}px;'>";
-        echo "<img src='https://cdn.comprahabbo.com/swf/c_images/catalogue/icon_{$sp['icon_image']}.png' class='page-icon' onerror=\"this.src='https://cdn.comprahabbo.com/swf/c_images/catalogue/icon_1.png'\"> ";
-        echo htmlspecialchars($sp['caption']);
+        
+        echo "<div class='menu-item-container draggable-subpage' data-id='{$sp['id']}'>";
+        // AQUI: Adicionado onclick='handleTabClick(...)' e removido ondblclick do SPAN
+        echo "<a href='?tab={$activeTabId}&page={$sp['id']}' class='" . ($isActive ? 'active' : '') . "' style='padding-left: {$padding}px;' onclick='handleTabClick(event, this.href, {$sp['id']}, this)'>";
+        
+        if ($hasChildren) {
+            $arrow = $isOpen ? '▼' : '▶';
+            echo "<span class='toggle-btn' onclick='toggleMenu(event, \"submenu-{$sp['id']}\", this)'>{$arrow}</span>";
+        } else {
+            echo "<span style='display:inline-block; width:15px; margin-right:5px;'></span>";
+        }
+        
+        echo "<img src='https://habbinfo.top/swf/c_images/catalogue/icon_{$sp['icon_image']}.png' class='page-icon' onerror=\"this.src='https://habbinfo.top/swf/c_images/catalogue/icon_1.png'\"> ";
+        echo "<span class='editable-name' title='Duplo clique para renomear'>" . htmlspecialchars($sp['caption']) . "</span>";
         echo "</a>";
-        if (isset($subPages[$sp['id']])) drawSidebarMenu($sp['id'], $subPages, $activeTabId, $activePageId, $level + 1);
+
+        if ($hasChildren) {
+            $display = $isOpen ? "block" : "none";
+            echo "<div id='submenu-{$sp['id']}' class='submenu-container' style='display: {$display};'>";
+            drawSidebarMenu($sp['id'], $subPages, $activeTabId, $activePageId, $activePath, $level + 1);
+            echo "</div>";
+        }
+        
+        echo "</div>"; 
     }
+    echo "</div>"; 
 }
 
 // ==========================================
@@ -119,7 +173,7 @@ if ($activeTabId === 'orphans') {
 // ==========================================
 // LER IMAGENS DA PASTA CATALOGUE
 // ==========================================
-$caminhoPastaImagens = 'catalogue'; 
+$caminhoPastaImagens = 'C:\xampp\htdocs\CATA\catalogue'; 
 $imagensDisponiveis = [];
 if (is_dir($caminhoPastaImagens)) {
     $arquivos = scandir($caminhoPastaImagens);
@@ -139,6 +193,7 @@ if (is_dir($caminhoPastaImagens)) {
 <head>
     <meta charset="UTF-8">
     <title>Catálogo Editor em Tempo Real</title>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -156,21 +211,38 @@ if (is_dir($caminhoPastaImagens)) {
         .top-tabs a.btn-add { background: #2ecc71; color: white; font-weight: bold; border-right: none;}
         .top-tabs a.btn-orphan { background: #f39c12; color: white; font-weight: bold; border-right: 1px solid #1a1a1a;}
         
+        .draggable-tab, .draggable-subpage { cursor: grab; }
+        .draggable-tab:active, .draggable-subpage:active { cursor: grabbing; }
+        .sortable-ghost { opacity: 0.5; background: #dcdcdc; border: 1px dashed #777; }
+
+        .editable-name { display: inline-block; padding: 1px 4px; border-radius: 3px; transition: background 0.2s; border: 1px solid transparent; }
+        .editable-name:hover { background: rgba(0,0,0,0.08); border-color: rgba(0,0,0,0.1); cursor: text;}
+        .inline-edit-input { font-family: 'Ubuntu', sans-serif; font-size: 13px; font-weight: inherit; color: #333; background: #fff; border: 1px solid #3498db; border-radius: 3px; padding: 1px 4px; outline: none; box-shadow: 0 0 3px rgba(52,152,219,0.5); width: auto; min-width: 60px;}
+
         .banner { background: #155a73 url('https://images.habbo.com/c_images/catalogue/catalog_header_habbo_club.gif') no-repeat right; height: 80px; display: flex; align-items: center; padding: 0 20px; border-bottom: 2px solid #1a1a1a;}
         .banner h2 { color: #fff; font-size: 20px; font-weight: bold; text-shadow: 1px 1px 2px rgba(0,0,0,0.5); }
 
         .content-area { display: flex; flex: 1; background: #e3e3ea; overflow: hidden; }
         
-        .sidebar { width: 220px; background: #fff; border-right: 2px solid #1a1a1a; display: flex; flex-direction: column;}
+        .sidebar { width: 260px; background: #fff; border-right: 2px solid #1a1a1a; display: flex; flex-direction: column;}
         .search-box { padding: 10px; background: #f4f4f4; border-bottom: 1px solid #ccc; display: flex;}
         .search-box input { flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 3px 0 0 3px; font-size: 12px; }
         .search-box button { background: #1c7b9c; border: 1px solid #1c7b9c; border-radius: 0 3px 3px 0; color: white; padding: 0 10px; cursor: pointer;}
         
-        .sub-pages-list { flex: 1; overflow-y: auto; list-style: none; }
-        .sub-pages-list a { padding: 6px 10px; text-decoration: none; color: #333; font-size: 13px; border-bottom: 1px solid #eee; display: flex; align-items: center; gap: 8px;}
-        .sub-pages-list a:hover { background: #f9f9f9; }
-        .sub-pages-list a.active { background: #4cb3d4; color: #fff; font-weight: bold; }
+        .sub-pages-list { flex: 1; overflow-y: auto; list-style: none; overflow-x: hidden; }
+        
+        .menu-item-container a { padding: 6px 10px; text-decoration: none; color: #333; font-size: 13px; border-bottom: 1px solid #eee; display: flex; align-items: center; gap: 4px; }
+        .menu-item-container a:hover { background: #f9f9f9; }
+        .menu-item-container a.active { background: #4cb3d4; color: #fff; font-weight: bold; }
         .page-icon { width: 20px; height: auto; object-fit: contain; }
+        
+        .toggle-btn { 
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 15px; height: 15px; background: #e3e3e3; border-radius: 3px;
+            font-size: 9px; cursor: pointer; color: #555; margin-right: 5px;
+        }
+        .toggle-btn:hover { background: #ccc; color: #000; }
+        .menu-item-container a.active .toggle-btn { background: #3b8ea8; color: #fff; }
 
         .main-panel { flex: 1; background: #fff; padding: 15px; overflow-y: auto; }
         
@@ -208,7 +280,6 @@ if (is_dir($caminhoPastaImagens)) {
         .editor-form { flex: 1; }
         .editor-preview { width: 300px; background: #a2b490; border: 2px solid #5d6d4f; border-radius: 5px; position: relative; display: flex; justify-content: center; align-items: center; overflow: hidden; }
         
-        /* CÓDIGO DA SIMULAÇÃO DE QUARTO (CSS ISOMÉTRICO) */
         .room-floor { position: absolute; width: 300px; height: 300px; background-size: 32px 16px; background-image: linear-gradient(to right, rgba(0,0,0,0.1) 1px, transparent 1px), linear-gradient(to bottom, rgba(0,0,0,0.1) 1px, transparent 1px); transform: rotateX(60deg) rotateZ(45deg); top: 50px; }
         .sim-mobi { position: absolute; bottom: 50%; left: 50%; transform: translateX(-50%); transition: all 0.3s ease; z-index: 2;}
         .sim-avatar { position: absolute; width: 30px; height: 60px; background: url('https://www.habbo.com/habbo-imaging/avatarimage?figure=hd-180-1.ch-210-66.lg-270-82.sh-290-91&action=std&direction=2&head_direction=2&img_format=png') no-repeat center bottom; z-index: 3; transition: all 0.3s ease; left: 50%; bottom: 50%; transform: translateX(-50%); pointer-events: none;}
@@ -235,19 +306,21 @@ if (is_dir($caminhoPastaImagens)) {
 <div class="catalog-window">
     <div class="header"><h1>Loja</h1><button class="btn-close">X</button></div>
 
-    <div class="top-tabs">
+    <div class="top-tabs" id="sortable-tabs">
         <?php foreach ($topTabs as $tab): ?>
-            <a href="?tab=<?= $tab['id'] ?>" class="<?= $activeTabId == $tab['id'] ? 'active' : '' ?>"><?= htmlspecialchars($tab['caption']) ?></a>
+            <!-- AQUI: Adicionado onclick e removido ondblclick do span -->
+            <a href="?tab=<?= $tab['id'] ?>" class="draggable-tab <?= $activeTabId == $tab['id'] ? 'active' : '' ?>" data-id="<?= $tab['id'] ?>" onclick="handleTabClick(event, this.href, <?= $tab['id'] ?>, this)">
+                <span class="editable-name" title="Duplo clique para renomear"><?= htmlspecialchars($tab['caption']) ?></span>
+            </a>
         <?php endforeach; ?>
-        <a href="?tab=orphans" class="btn-orphan <?= $activeTabId === 'orphans' ? 'active' : '' ?>">📦 Sem Catálogo</a>
-        <a href="?tab=new" class="btn-add <?= $activeTabId === 'new' ? 'active' : '' ?>">⚙️ Nova Aba</a>
+        <a href="?tab=orphans" class="btn-orphan ignore-drag <?= $activeTabId === 'orphans' ? 'active' : '' ?>">📦 Sem Catálogo</a>
+        <a href="?tab=new" class="btn-add ignore-drag <?= $activeTabId === 'new' ? 'active' : '' ?>">⚙️ Nova Aba</a>
     </div>
 
     <div class="banner"><h2>Catálogo Manager</h2></div>
 
     <div class="content-area">
         <?php if ($activeTabId === 'new'): ?>
-            <!-- FORMULÁRIO DE NOVA PÁGINA -->
             <div class="main-panel">
                 <h3>⚙️ Adicionar Nova Página ao Catálogo</h3>
                 <?= $mensagem ?>
@@ -275,7 +348,9 @@ if (is_dir($caminhoPastaImagens)) {
             <?php if ($activeTabId !== 'orphans'): ?>
             <div class="sidebar">
                 <div class="search-box"><input type="text" placeholder="Procurar"><button>🔍</button></div>
-                <div class="sub-pages-list"><?php drawSidebarMenu($activeTabId, $subPages, $activeTabId, $activePageId, 0); ?></div>
+                <div class="sub-pages-list" id="sidebar-menu-wrapper">
+                    <?php drawSidebarMenu($activeTabId, $subPages, $activeTabId, $activePageId, $activePath, 0); ?>
+                </div>
             </div>
             <?php endif; ?>
 
@@ -286,13 +361,17 @@ if (is_dir($caminhoPastaImagens)) {
                     <div style="background: #f9f9f9; padding: 20px; text-align: center; color: #777; margin-top: 20px;">Clique em uma página no menu ao lado.</div>
                 <?php else: ?>
                     
-                    <!-- CAIXA DE EDIÇÃO DA PÁGINA NORMAL -->
                     <div class="page-info-box">
                         <div id="header-img-container">
-                            <img id="current-headline-img" src="https://cdn.comprahabbo.com/swf/c_images/catalogue/<?= htmlspecialchars($activePageData['page_headline']) ?>.png" onerror="if(this.src.endsWith('.png')) this.src=this.src.replace('.png', '.gif'); else this.style.display='none';" class="headline-img" alt="Sem Imagem">
+                            <?php $hl = $activePageData['page_headline'] ?? ''; ?>
+                            <img id="current-headline-img" 
+                                 src="<?= $hl ? '/CATA/catalogue/' . htmlspecialchars($hl) . '.png' : '' ?>" 
+                                 onerror="if(this.src.indexOf('.png') !== -1) { this.src = this.src.replace('.png', '.gif'); } else { this.style.display = 'none'; }" 
+                                 class="headline-img" 
+                                 style="<?= empty($hl) ? 'display: none;' : 'display: block;' ?>" 
+                                 alt="Imagem do Topo">
                         </div>
                         
-                        <!-- Modo Leitura -->
                         <div class="page-info-texts" id="page-text-view" style="width: 100%;">
                             <h4><?= htmlspecialchars($activePageData['caption']) ?></h4>
                             <p><?= nl2br(htmlspecialchars($activePageData['page_text1'])) ?></p>
@@ -301,7 +380,6 @@ if (is_dir($caminhoPastaImagens)) {
                             <button class="btn-edit-page" onclick="togglePageEdit()">✏️ Editar Página Completa</button>
                         </div>
 
-                        <!-- Modo Edição (Formulário AJAX) -->
                         <form id="page-text-edit" class="page-edit-form" onsubmit="savePageAjax(event)">
                             <input type="hidden" name="page_id" value="<?= $activePageData['id'] ?>">
                             <div class="edit-grid">
@@ -357,7 +435,6 @@ if (is_dir($caminhoPastaImagens)) {
                         <?php foreach ($itensDaPagina as $item): ?>
                             <?php $isOrphan = ($activeTabId === 'orphans'); $uniqueId = $isOrphan ? $item['base_id'] : $item['catalog_id']; ?>
                             
-                            <!-- CARD DO MOBI -->
                             <div class="item-card" id="card-<?= $uniqueId ?>" <?= $isOrphan ? 'style="background: #fdf2e9; border-color: #f39c12;"' : '' ?>>
                                 <div class="item-badges">
                                     <?php if($item['allow_sit'] == 1): ?><span class="badge-icon" title="Pode Sentar">🪑</span><?php endif; ?>
@@ -379,10 +456,8 @@ if (is_dir($caminhoPastaImagens)) {
                                 <button class="btn-config <?= $isOrphan ? 'orange' : '' ?>" onclick="toggleDetails('<?= $uniqueId ?>')">⚙️ Configurações</button>
                             </div>
                             
-                            <!-- PAINEL DE DETALHES (FORMULÁRIO + SIMULADOR) -->
                             <div id="details-<?= $uniqueId ?>" class="details-panel" <?= $isOrphan ? 'style="border-color: #f39c12;"' : '' ?>>
                                 <div class="editor-container">
-                                    
                                     <div class="editor-form">
                                         <form id="form-item-<?= $uniqueId ?>" onsubmit="<?= $isOrphan ? 'saveBaseItemAjax' : 'saveItemAjax' ?>(event, <?= $uniqueId ?>)">
                                             <input type="hidden" name="<?= $isOrphan ? 'base_id' : 'catalog_id' ?>" value="<?= $uniqueId ?>">
@@ -426,7 +501,6 @@ if (is_dir($caminhoPastaImagens)) {
                                             <button onclick="testSim(<?= $uniqueId ?>, 'interact')" style="cursor:pointer; background:#2980b9; color:#fff; border:1px solid #555; border-radius:2px; padding:2px;">Testar Mobi</button>
                                         </div>
                                     </div>
-                                    
                                 </div>
                             </div>
                         <?php endforeach; ?>
@@ -438,6 +512,127 @@ if (is_dir($caminhoPastaImagens)) {
 </div>
 
 <script>
+// =======================================================
+// LÓGICA DE CLIQUE ÚNICO vs CLIQUE DUPLO NAS ABAS
+// =======================================================
+let clickTimeout = null;
+
+function handleTabClick(event, url, id, linkElement) {
+    // Ignora completamente se clicar no input de edição, na setinha de expandir menu
+    if (event.target.tagName === 'INPUT' || event.target.classList.contains('toggle-btn')) {
+        return;
+    }
+
+    // Impede o link de abrir a página na mesma hora
+    event.preventDefault(); 
+
+    let span = linkElement.querySelector('.editable-name');
+
+    if (clickTimeout !== null) {
+        // --- É UM CLIQUE DUPLO ---
+        clearTimeout(clickTimeout);
+        clickTimeout = null;
+        editInlineName(event, span, id);
+    } else {
+        // --- É O PRIMEIRO CLIQUE ---
+        // Aguarda 250 milissegundos para ver se vem o segundo clique. Se não vier, navega.
+        clickTimeout = setTimeout(function() {
+            clickTimeout = null;
+            window.location.href = url; 
+        }, 250); 
+    }
+}
+
+// =======================================================
+// EDIÇÃO INLINE (Click-to-Edit)
+// =======================================================
+function editInlineName(e, span, id) {
+    if (span.querySelector('input')) return; // Já está editando
+
+    let currentText = span.innerText.trim();
+    let input = document.createElement('input');
+    input.type = 'text';
+    input.value = currentText;
+    input.className = 'inline-edit-input';
+    input.style.width = Math.max(60, currentText.length * 8) + 'px';
+
+    span.innerHTML = '';
+    span.appendChild(input);
+    input.focus();
+    input.select();
+
+    // Impede que as interações com o Input afetem a navegação
+    input.addEventListener('click', function(ev) { ev.stopPropagation(); ev.preventDefault(); });
+    input.addEventListener('mousedown', function(ev) { ev.stopPropagation(); });
+
+    let isSaved = false;
+
+    function save() {
+        if(isSaved) return;
+        isSaved = true;
+
+        let newText = input.value.trim();
+        if (newText === '' || newText === currentText) {
+            span.innerText = currentText;
+            return;
+        }
+
+        span.innerHTML = '⏳...';
+
+        let fd = new FormData();
+        fd.append('ajax_action', 'rename_page');
+        fd.append('page_id', id);
+        fd.append('caption', newText);
+
+        fetch('index.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if(d.success) {
+                span.innerText = d.new_caption;
+                // Atualiza também o título grande se estivermos dentro desta página
+                let pageTitle = document.querySelector('#page-text-view h4');
+                let inputEdit = document.querySelector('input[name="caption"]');
+                if (pageTitle && window.location.search.includes('page=' + id)) {
+                    pageTitle.innerText = d.new_caption;
+                    if(inputEdit) inputEdit.value = d.new_caption;
+                }
+            } else {
+                span.innerText = currentText;
+            }
+        }).catch(() => {
+            span.innerText = currentText;
+        });
+    }
+
+    input.addEventListener('blur', save);
+    input.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter') {
+            ev.preventDefault();
+            save();
+        } else if (ev.key === 'Escape') {
+            isSaved = true;
+            span.innerText = currentText;
+        }
+    });
+}
+
+// =======================================================
+// CONTROLE DOS MENUS EXPANSÍVEIS
+// =======================================================
+function toggleMenu(e, targetId, btn) {
+    e.preventDefault();
+    e.stopPropagation(); 
+    
+    var el = document.getElementById(targetId);
+    if (el.style.display === 'none' || el.style.display === '') {
+        el.style.display = 'block';
+        btn.innerText = '▼';
+    } else {
+        el.style.display = 'none';
+        btn.innerText = '▶';
+    }
+}
+
 function toggleDetails(id) {
     var panel = document.getElementById('details-' + id);
     var card = document.getElementById('card-' + id);
@@ -453,7 +648,6 @@ function toggleDetails(id) {
     }
 }
 
-// Simulador Isométrico 
 function updateSim(id) {
     let z = parseFloat(document.getElementById('z-' + id).value) || 0;
     let sit = document.getElementById('sit-' + id).value;
@@ -490,15 +684,23 @@ function testSim(id, action) {
     }
 }
 
-// Interações da Página
 function previewHeadline() {
     var select = document.getElementById('select_headline');
     var img = document.getElementById('current-headline-img');
-    if (select && select.value) {
-        img.src = "https://cdn.comprahabbo.com/swf/c_images/catalogue/" + select.value + ".png";
+    
+    if (select && select.value !== "") {
         img.style.display = "block";
+        img.onerror = function() {
+            if (this.src.indexOf('.png') !== -1) {
+                this.src = this.src.replace('.png', '.gif');
+            } else {
+                this.style.display = 'none';
+            }
+        };
+        img.src = "/CATA/catalogue/" + select.value + ".png";
     } else if (img) {
         img.style.display = "none";
+        img.src = "";
     }
 }
 
@@ -518,7 +720,6 @@ function togglePageEdit() {
     }
 }
 
-// Salvamento AJAX
 function saveItemAjax(event, id) {
     event.preventDefault();
     const btn = document.getElementById('btn-save-' + id);
@@ -545,6 +746,59 @@ function savePageAjax(event) {
         if(d.success) { btn.innerText='✔️ Salva!'; setTimeout(()=>location.reload(), 500); }
     });
 }
+
+document.addEventListener('DOMContentLoaded', function() {
+    var tabsContainer = document.getElementById('sortable-tabs');
+    if (tabsContainer) {
+        new Sortable(tabsContainer, {
+            animation: 150,
+            filter: '.ignore-drag, .inline-edit-input',
+            preventOnFilter: false,
+            draggable: '.draggable-tab',
+            ghostClass: 'sortable-ghost',
+            onEnd: function (evt) {
+                let fd = new FormData();
+                fd.append('ajax_action', 'reorder_pages');
+                
+                document.querySelectorAll('#sortable-tabs .draggable-tab').forEach(tab => {
+                    fd.append('page_ids[]', tab.getAttribute('data-id'));
+                });
+
+                fetch('index.php', { method: 'POST', body: fd })
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) console.log('Ordem das abas do topo atualizada!');
+                });
+            }
+        });
+    }
+
+    var subpagesContainers = document.querySelectorAll('.sortable-level');
+    subpagesContainers.forEach(function(container) {
+        new Sortable(container, {
+            animation: 150,
+            draggable: '.menu-item-container',
+            filter: '.toggle-btn, .inline-edit-input', 
+            preventOnFilter: false, 
+            ghostClass: 'sortable-ghost',
+            onEnd: function (evt) {
+                let fd = new FormData();
+                fd.append('ajax_action', 'reorder_pages');
+                
+                let items = Array.from(evt.to.children).filter(el => el.classList.contains('menu-item-container'));
+                items.forEach(sub => {
+                    fd.append('page_ids[]', sub.getAttribute('data-id'));
+                });
+
+                fetch('index.php', { method: 'POST', body: fd })
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) console.log('Ordem das sub-páginas atualizada com sucesso!');
+                });
+            }
+        });
+    });
+});
 </script>
 
 </body>
